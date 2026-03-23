@@ -1,6 +1,4 @@
-import { ChatOpenAI } from '@langchain/openai';
-import { PromptTemplate } from '@langchain/core/prompts';
-import { HumanMessage } from '@langchain/core/messages';
+import { MultiServerMCPClient } from '@langchain/mcp-adapters';
 import { responseSchema } from '../schemas/camera.js';
 
 const USER_PROMPT_TEMPLATE = `用户当前手机相机参数：
@@ -55,51 +53,110 @@ export interface VisionChainOutput {
   filterPresetId: 'soft_portrait' | 'crisp_landscape' | 'cinematic_street' | 'warm_food';
 }
 
-function createVisionModel() {
-  const modelName = process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini';
-  const baseURL = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
+let mcpClient: MultiServerMCPClient | null = null;
+let visionTools: ReturnType<MultiServerMCPClient['getTools']> | null = null;
 
-  return new ChatOpenAI({
-    model: modelName,
-    temperature: 0,
-    apiKey: process.env.OPENAI_API_KEY,
-    configuration: { baseURL },
-  });
+async function getMCPClient(): Promise<MultiServerMCPClient> {
+  if (!mcpClient) {
+    mcpClient = new MultiServerMCPClient({
+      mcpServers: {
+        vision: {
+          transport: 'stdio',
+          command: 'npx',
+          args: ['-y', '@z_ai/mcp-server'],
+          env: {
+            Z_AI_API_KEY: process.env.OPENAI_API_KEY || '',
+            Z_AI_MODE: 'ZHIPU',
+          },
+          restart: {
+            enabled: true,
+            maxAttempts: 3,
+            delayMs: 1000,
+          },
+        },
+      },
+      useStandardContentBlocks: true,
+    });
+  }
+  return mcpClient;
 }
 
-let modelInstance: ReturnType<typeof createVisionModel> | null = null;
-
-function getModel() {
-  if (!modelInstance) {
-    modelInstance = createVisionModel();
+async function getVisionTools() {
+  if (!visionTools) {
+    const client = await getMCPClient();
+    visionTools = client.getTools();
   }
-  return modelInstance;
+  return visionTools;
 }
 
 export async function analyzeVision(
   input: VisionChainInput
 ): Promise<VisionChainOutput> {
-  const model = getModel();
-  const structuredModel = model.withStructuredOutput(responseSchema);
+  const tools = await getVisionTools();
 
-  const prompt = PromptTemplate.fromTemplate(USER_PROMPT_TEMPLATE);
-  const formattedPrompt = await prompt.format({
-    selectedPointX: input.selectedPointX.toFixed(3),
-    selectedPointY: input.selectedPointY.toFixed(3),
-    zoom: input.zoom.toFixed(2),
-    exposureBias: input.exposureBias.toFixed(2),
+  // Find the General Image Analysis tool
+  const imageAnalysisTool = tools.find(
+    (tool: { name?: string }) => tool.name === 'general_image_analysis'
+  );
+
+  if (!imageAnalysisTool) {
+    throw new Error('General Image Analysis tool not found in MCP server');
+  }
+
+  // Call the MCP vision tool with the image
+  const imageData = `data:image/jpeg;base64,${input.imageBase64}`;
+
+  const toolResult = await imageAnalysisTool.invoke({
+    image: imageData,
+    prompt: USER_PROMPT_TEMPLATE
+      .replace('{selectedPointX}', input.selectedPointX.toFixed(3))
+      .replace('{selectedPointY}', input.selectedPointY.toFixed(3))
+      .replace('{zoom}', input.zoom.toFixed(2))
+      .replace('{exposureBias}', input.exposureBias.toFixed(2)),
   });
 
-  const imageUrl = `data:image/jpeg;base64,${input.imageBase64}`;
+  // Parse the result - the tool returns a structured response
+  let analysisResult: unknown;
 
-  const result = await structuredModel.invoke([
-    new HumanMessage({
-      content: [
-        { type: 'text', text: formattedPrompt },
-        { type: 'image_url', image_url: imageUrl },
-      ],
-    }),
-  ]);
+  if (typeof toolResult === 'string') {
+    try {
+      analysisResult = JSON.parse(toolResult);
+    } catch {
+      throw new Error('Failed to parse MCP tool result: ' + toolResult);
+    }
+  } else if (toolResult && typeof toolResult === 'object' && 'content' in toolResult) {
+    // MCP response format with content blocks
+    const content = (toolResult as { content: Array<{ text?: string }> }).content;
+    if (content && content[0]?.text) {
+      try {
+        analysisResult = JSON.parse(content[0].text);
+      } catch {
+        analysisResult = content[0].text;
+      }
+    }
+  } else {
+    analysisResult = toolResult;
+  }
 
-  return result as VisionChainOutput;
+  // If the result is a string, try to parse it as JSON
+  if (typeof analysisResult === 'string') {
+    try {
+      analysisResult = JSON.parse(analysisResult);
+    } catch {
+      throw new Error('Failed to parse analysis result: ' + analysisResult);
+    }
+  }
+
+  // Validate and return the result using responseSchema
+  const validated = responseSchema.parse(analysisResult);
+  return validated as VisionChainOutput;
+}
+
+// Cleanup function to close MCP client
+export async function cleanup() {
+  if (mcpClient) {
+    await mcpClient.close();
+    mcpClient = null;
+    visionTools = null;
+  }
 }
