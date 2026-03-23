@@ -1,10 +1,11 @@
 import { StatusBar } from 'expo-status-bar';
 import { CameraCapturedPicture, CameraView, useCameraPermissions } from 'expo-camera';
 import * as MediaLibrary from 'expo-media-library';
-import { useEffect, useEffectEvent, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
+  Platform,
   Pressable,
   SafeAreaView,
   StyleSheet,
@@ -15,8 +16,6 @@ import {
 import { GuideOverlay } from './src/components/GuideOverlay';
 import { RecommendationPanel } from './src/components/RecommendationPanel';
 import { analyzeSceneLocally, hydrateVisionAnalysis } from './src/services/guideEngine';
-import { buildCroppedPhoto } from './src/services/postProcess';
-import { renderFilterToFile } from './src/services/skiaFilter';
 import { analyzeFrameWithVision, hasVisionEndpoint } from './src/services/visionClient';
 import { NormalizedPoint, ReviewPhoto, SceneAnalysis } from './src/types/camera';
 
@@ -24,6 +23,14 @@ const defaultPoint = { x: 0.5, y: 0.48 };
 const liveIntervalMs = 3200;
 
 type FacingMode = 'front' | 'back';
+
+// Intent icons (emoji)
+const INTENT_ICONS: Record<string, string> = {
+  portrait: '👤',
+  landscape: '🏞️',
+  food: '🍜',
+  street: '🏙️',
+};
 
 export default function App() {
   const [permission, requestPermission] = useCameraPermissions();
@@ -37,7 +44,8 @@ export default function App() {
   const [previewSize, setPreviewSize] = useState({ width: 0, height: 0 });
   const [capturing, setCapturing] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
-  const [liveEnabled, setLiveEnabled] = useState(true);
+  const [liveEnabled, setLiveEnabled] = useState(() => hasVisionEndpoint());
+  const [showGuideTip, setShowGuideTip] = useState(true);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [reviewPhoto, setReviewPhoto] = useState<ReviewPhoto | null>(null);
   const [showOriginal, setShowOriginal] = useState(false);
@@ -52,8 +60,16 @@ export default function App() {
   );
   const cameraRef = useRef<CameraView | null>(null);
   const analysisLockRef = useRef(false);
+  const runVisionAnalysisRef = useRef<() => Promise<void>>(async () => {});
+  const rafRef = useRef<ReturnType<typeof requestAnimationFrame> | null>(null);
+  const lastAnalysisTimeRef = useRef(0);
+  const focusPointRef = useRef<NormalizedPoint>(focusPoint);
+  // Keep ref in sync with state
+  useEffect(() => {
+    focusPointRef.current = focusPoint;
+  }, [focusPoint]);
 
-  const refreshLocalAnalysis = useEffectEvent((nextPoint: NormalizedPoint, nextZoom: number, nextExposure: number) => {
+  const refreshLocalAnalysis = (nextPoint: NormalizedPoint, nextZoom: number, nextExposure: number) => {
     setAnalysis(
       analyzeSceneLocally({
         focusPoint: nextPoint,
@@ -61,10 +77,15 @@ export default function App() {
         exposureBias: nextExposure,
       })
     );
-  });
+  };
 
-  const runVisionAnalysis = useEffectEvent(async () => {
+  runVisionAnalysisRef.current = async () => {
     if (!cameraRef.current || !cameraReady || capturing || reviewPhoto || analysisLockRef.current) {
+      return;
+    }
+
+    if (!hasVisionEndpoint()) {
+      refreshLocalAnalysis(focusPoint, zoom, exposureBias);
       return;
     }
 
@@ -79,7 +100,7 @@ export default function App() {
         shutterSound: false,
       })) as CameraCapturedPicture;
 
-      if (!frame.base64 || !hasVisionEndpoint()) {
+      if (!frame.base64) {
         refreshLocalAnalysis(focusPoint, zoom, exposureBias);
         return;
       }
@@ -96,32 +117,55 @@ export default function App() {
       setAnalysisError(null);
     } catch (error) {
       refreshLocalAnalysis(focusPoint, zoom, exposureBias);
-      setAnalysisError(error instanceof Error ? error.message : '视觉分析失败');
+      setAnalysisError(error instanceof Error ? error.message : 'Vision failed');
     } finally {
       setAnalyzing(false);
       analysisLockRef.current = false;
     }
-  });
+  };
 
   useEffect(() => {
-    if (!liveEnabled || reviewPhoto || !cameraReady) {
+    if (!liveEnabled || reviewPhoto || !cameraReady || !hasVisionEndpoint()) {
       return;
     }
 
     const timer = setInterval(() => {
-      void runVisionAnalysis();
+      void runVisionAnalysisRef.current();
     }, liveIntervalMs);
 
     return () => {
       clearInterval(timer);
     };
-  }, [cameraReady, liveEnabled, reviewPhoto, runVisionAnalysis]);
+  }, [cameraReady, liveEnabled, reviewPhoto]);
+
+  useEffect(() => {
+    if (!liveEnabled || !cameraReady) {
+      return;
+    }
+
+    const tick = (timestamp: number) => {
+      if (timestamp - lastAnalysisTimeRef.current >= 800) {
+        lastAnalysisTimeRef.current = timestamp;
+        refreshLocalAnalysis(focusPoint, zoom, exposureBias);
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [liveEnabled, cameraReady, focusPoint, zoom, exposureBias]);
 
   const handlePickPoint = (point: NormalizedPoint) => {
     setFocusPoint(point);
     refreshLocalAnalysis(point, zoom, exposureBias);
-    if (liveEnabled) {
-      void runVisionAnalysis();
+    if (liveEnabled && hasVisionEndpoint()) {
+      void runVisionAnalysisRef.current();
     }
   };
 
@@ -133,6 +177,13 @@ export default function App() {
   const handleExposureChange = (value: number) => {
     setExposureBias(value);
     refreshLocalAnalysis(focusPoint, zoom, value);
+  };
+
+  const handleReset = () => {
+    setFocusPoint(defaultPoint);
+    setZoom(0.16);
+    setExposureBias(0);
+    setAnalysisError(null);
   };
 
   const handleCapture = async () => {
@@ -148,27 +199,45 @@ export default function App() {
         skipProcessing: false,
       })) as CameraCapturedPicture;
 
+      if (!photo?.uri) {
+        throw new Error('Failed to capture photo');
+      }
+
+      const safeAnalysis = analysis ?? analyzeSceneLocally({ focusPoint: defaultPoint, zoom: 0.16, exposureBias: 0 });
+      const { buildCroppedPhoto } = await import('./src/services/postProcess');
       const cropped = await buildCroppedPhoto({
         uri: photo.uri,
-        width: photo.width,
-        height: photo.height,
-        analysis,
+        width: photo.width ?? 0,
+        height: photo.height ?? 0,
+        analysis: safeAnalysis,
       });
 
-      const filteredUri = await renderFilterToFile({
-        uri: cropped.uri,
-        presetId: analysis.colorGrade.id,
-      });
+      let filteredUri = cropped.uri;
+
+      try {
+        const { renderFilterToFile } = await import('./src/services/skiaFilter');
+        const colorGradeId = safeAnalysis?.colorGrade?.id ?? 'neutral';
+        if (colorGradeId !== 'neutral') {
+          filteredUri = await renderFilterToFile({
+            uri: cropped.uri,
+            presetId: colorGradeId,
+          });
+        }
+      } catch (error) {
+        setSavedMessage('LUT failed, using cropped');
+      }
 
       setReviewPhoto({
         originalUri: photo.uri,
         croppedUri: cropped.uri,
         filteredUri,
-        width: photo.width,
-        height: photo.height,
-        analysis,
+        width: photo.width ?? 0,
+        height: photo.height ?? 0,
+        analysis: safeAnalysis,
       });
       setShowOriginal(false);
+    } catch (error) {
+      setSavedMessage(error instanceof Error ? error.message : 'Capture failed');
     } finally {
       setCapturing(false);
     }
@@ -186,13 +255,13 @@ export default function App() {
         const result = await requestMediaPermission();
 
         if (!result.granted) {
-          setSavedMessage('未授予相册权限，无法导出');
+          setSavedMessage('No album permission');
           return;
         }
       }
 
       await MediaLibrary.saveToLibraryAsync(reviewPhoto.filteredUri);
-      setSavedMessage('已导出到系统相册');
+      setSavedMessage('Saved to album');
     } finally {
       setExporting(false);
     }
@@ -211,12 +280,12 @@ export default function App() {
       <SafeAreaView style={styles.permissionScreen}>
         <StatusBar style="light" />
         <Text style={styles.permissionEyebrow}>AI Camera Guide</Text>
-        <Text style={styles.permissionTitle}>先授予相机权限，才能做实时视觉分析和机位引导</Text>
+        <Text style={styles.permissionTitle}>Camera access required for real-time visual analysis</Text>
         <Text style={styles.permissionText}>
-          这版已经支持接入真实视觉模型、箭头式实时引导，以及拍后真实滤镜渲染导出。
+          Supports real vision models, arrow guidance, and post-capture filter rendering.
         </Text>
         <Pressable onPress={requestPermission} style={styles.primaryButtonSolo}>
-          <Text style={styles.primaryButtonLabel}>允许访问相机</Text>
+          <Text style={styles.primaryButtonLabel}>Allow Access</Text>
         </Pressable>
       </SafeAreaView>
     );
@@ -230,14 +299,9 @@ export default function App() {
       <SafeAreaView style={styles.reviewScreen}>
         <StatusBar style="light" />
         <View style={styles.reviewHeader}>
-          <View>
-            <Text style={styles.reviewEyebrow}>LUT 渲染完成</Text>
-            <Text style={styles.reviewTitle}>{colorGrade.name}</Text>
-            <Text style={styles.reviewDescription}>{colorGrade.description}</Text>
-          </View>
+          <Text style={styles.reviewEyebrow}>{colorGrade?.name ?? 'Default'}</Text>
           <View style={styles.scorePill}>
             <Text style={styles.scorePillValue}>{reviewPhoto.analysis.overallScore}</Text>
-            <Text style={styles.scorePillLabel}>得分</Text>
           </View>
         </View>
 
@@ -246,40 +310,34 @@ export default function App() {
         </View>
 
         <View style={styles.toggleRow}>
-          <ToggleButton label="LUT 成片" active={!showOriginal} onPress={() => setShowOriginal(false)} />
-          <ToggleButton label="原图" active={showOriginal} onPress={() => setShowOriginal(true)} />
+          <ToggleButton label="FILM" active={!showOriginal} onPress={() => setShowOriginal(false)} />
+          <ToggleButton label="RAW" active={showOriginal} onPress={() => setShowOriginal(true)} />
         </View>
 
         <View style={styles.gradePanel}>
-          <Text style={styles.gradePanelTitle}>滤镜参数</Text>
           <View style={styles.gradeStats}>
-            <GradeChip label="Contrast" value={colorGrade.contrast} accentColor={colorGrade.accentColor} />
-            <GradeChip label="Saturation" value={colorGrade.saturation} accentColor={colorGrade.accentColor} />
-            <GradeChip label="Warmth" value={colorGrade.warmth} accentColor={colorGrade.accentColor} />
+            <GradeStat icon="◐" value={colorGrade?.contrast ?? '—'} />
+            <GradeStat icon="◑" value={colorGrade?.saturation ?? '—'} />
+            <GradeStat icon="◔" value={colorGrade?.warmth ?? '—'} />
           </View>
-          <Text style={styles.gradeHint}>
-            已先按推荐构图完成裁切，再用 Skia 做真实滤镜像素渲染并导出为 JPEG。
-          </Text>
           {savedMessage ? <Text style={styles.savedMessage}>{savedMessage}</Text> : null}
         </View>
 
         <View style={styles.reviewActions}>
           <Pressable onPress={() => setReviewPhoto(null)} style={styles.secondaryButton}>
-            <Text style={styles.secondaryButtonLabel}>返回相机</Text>
+            <Text style={styles.secondaryButtonLabel}>Back</Text>
           </Pressable>
-          <Pressable onPress={handleExport} style={styles.secondaryButton}>
-            <Text style={styles.secondaryButtonLabel}>{exporting ? '导出中' : '导出到相册'}</Text>
+          <Pressable onPress={handleExport} style={styles.primaryButton}>
+            <Text style={styles.primaryButtonLabel}>{exporting ? 'Saving' : 'Save'}</Text>
           </Pressable>
           <Pressable
             onPress={() => {
               setReviewPhoto(null);
-              setFocusPoint(defaultPoint);
-              setZoom(0.16);
-              setExposureBias(0);
+              handleReset();
             }}
-            style={styles.primaryButton}
+            style={styles.secondaryButton}
           >
-            <Text style={styles.primaryButtonLabel}>再次拍摄</Text>
+            <Text style={styles.secondaryButtonLabel}>Retry</Text>
           </Pressable>
         </View>
       </SafeAreaView>
@@ -304,28 +362,28 @@ export default function App() {
         }}
       />
 
-      <SafeAreaView style={styles.overlayShell}>
+      <SafeAreaView style={styles.overlayShell} pointerEvents="box-none">
         <View style={styles.topBar}>
           <View style={styles.intentBadge}>
-            <Text style={styles.intentBadgeLabel}>
-              {analysis.intent === 'portrait'
-                ? '人物'
-                : analysis.intent === 'landscape'
-                  ? '风景'
-                  : analysis.intent === 'food'
-                    ? '美食'
-                    : '街拍'}
+            <Text style={styles.intentBadgeIcon}>
+              {INTENT_ICONS[analysis.intent] ?? 'S'}
             </Text>
           </View>
           <View style={styles.topActions}>
-            <SmallActionButton
-              label={torchEnabled ? '补光开' : '补光关'}
-              onPress={() => setTorchEnabled((value) => !value)}
+            <IconButton
+              icon={torchEnabled ? '◐' : '○'}
+              active={torchEnabled}
+              onPress={() => setTorchEnabled((v) => !v)}
             />
-            <SmallActionButton
-              label={facing === 'back' ? '后摄' : '前摄'}
-              onPress={() => setFacing((value) => (value === 'back' ? 'front' : 'back'))}
+            <IconButton
+              icon={facing === 'back' ? '◧' : '◨'}
+              onPress={() => setFacing((v) => (v === 'back' ? 'front' : 'back'))}
             />
+            {showGuideTip ? (
+              <IconButton icon="✕" onPress={() => setShowGuideTip(false)} />
+            ) : (
+              <IconButton icon="✕" onPress={() => setShowGuideTip(true)} />
+            )}
           </View>
         </View>
 
@@ -334,6 +392,10 @@ export default function App() {
           previewWidth={previewSize.width}
           previewHeight={previewSize.height}
           onPickPoint={handlePickPoint}
+          liveEnabled={liveEnabled}
+          showGuideTip={showGuideTip}
+          onToggleGuideTip={() => setShowGuideTip((v) => !v)}
+          focusPointRef={focusPointRef}
         />
 
         <View style={styles.bottomSheet}>
@@ -343,23 +405,13 @@ export default function App() {
             exposureBias={exposureBias}
             liveEnabled={liveEnabled}
             analyzing={analyzing}
-            onToggleLive={() => setLiveEnabled((value) => !value)}
+            onToggleLive={() => setLiveEnabled((v) => !v)}
             onZoomChange={handleZoomChange}
             onExposureChange={handleExposureChange}
           />
 
           <View style={styles.captureRow}>
-            <Pressable
-              onPress={() => {
-                setFocusPoint(defaultPoint);
-                setZoom(0.16);
-                setExposureBias(0);
-                setAnalysisError(null);
-              }}
-              style={styles.resetButton}
-            >
-              <Text style={styles.resetButtonLabel}>重置点位</Text>
-            </Pressable>
+            <View style={styles.captureInfo} />
 
             <Pressable
               onPress={handleCapture}
@@ -368,18 +420,7 @@ export default function App() {
               <View style={styles.captureInner} />
             </Pressable>
 
-            <View style={styles.captureInfo}>
-              {capturing ? (
-                <>
-                  <ActivityIndicator color="#F3C97A" />
-                  <Text style={styles.captureInfoText}>裁切与 LUT 渲染中</Text>
-                </>
-              ) : (
-                <Text style={styles.captureInfoText}>
-                  {analysisError ? '视觉服务异常，已回退本地' : '点主体后拍摄'}
-                </Text>
-              )}
-            </View>
+            <View style={styles.captureInfo} />
           </View>
         </View>
       </SafeAreaView>
@@ -387,10 +428,10 @@ export default function App() {
   );
 }
 
-function SmallActionButton({ label, onPress }: { label: string; onPress: () => void }) {
+function IconButton({ icon, active, onPress, size = 36 }: { icon: string; active?: boolean; onPress: () => void; size?: number }) {
   return (
-    <Pressable onPress={onPress} style={styles.smallActionButton}>
-      <Text style={styles.smallActionLabel}>{label}</Text>
+    <Pressable onPress={onPress} style={[styles.iconButton, active && styles.iconButtonActive, { width: size, height: size, borderRadius: size / 2 }]}>
+      <Text style={[styles.iconButtonText, active && styles.iconButtonTextActive]}>{icon}</Text>
     </Pressable>
   );
 }
@@ -411,19 +452,11 @@ function ToggleButton({
   );
 }
 
-function GradeChip({
-  label,
-  value,
-  accentColor,
-}: {
-  label: string;
-  value: string;
-  accentColor: string;
-}) {
+function GradeStat({ icon, value }: { icon: string; value: string }) {
   return (
-    <View style={[styles.gradeChip, { borderColor: accentColor }]}>
-      <Text style={styles.gradeChipLabel}>{label}</Text>
-      <Text style={styles.gradeChipValue}>{value}</Text>
+    <View style={styles.gradeStat}>
+      <Text style={styles.gradeStatIcon}>{icon}</Text>
+      <Text style={styles.gradeStatValue}>{value}</Text>
     </View>
   );
 }
@@ -439,219 +472,230 @@ const styles = StyleSheet.create({
   overlayShell: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: 'space-between',
+    zIndex: 10,
   },
   topBar: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 18,
-    paddingTop: 8,
+    paddingHorizontal: 20,
+    paddingTop: Platform.OS === 'ios' ? 8 : 12,
+    paddingBottom: 8,
   },
   intentBadge: {
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 999,
-    backgroundColor: 'rgba(14, 16, 21, 0.68)',
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  intentBadgeLabel: {
-    color: '#F3C97A',
-    fontWeight: '700',
-    fontSize: 14,
+  intentBadgeIcon: {
+    fontSize: 20,
   },
   topActions: {
     flexDirection: 'row',
     gap: 10,
   },
-  smallActionButton: {
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 999,
-    backgroundColor: 'rgba(14, 16, 21, 0.68)',
+  guideCloseBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingTop: 20,
   },
-  smallActionLabel: {
-    color: '#F7F4EE',
-    fontSize: 13,
-    fontWeight: '600',
+  guideCloseText: {
+    color: '#FFFFFF',
+    fontSize: 28,
+    fontWeight: '300',
+  },
+  iconButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  iconButtonActive: {
+    backgroundColor: 'rgba(243, 201, 122, 0.2)',
+  },
+  iconButtonText: {
+    color: '#F0EDE6',
+    fontSize: 16,
+    fontWeight: '400',
+  },
+  iconButtonTextActive: {
+    color: '#F3C97A',
   },
   bottomSheet: {
-    paddingBottom: 10,
+    paddingBottom: 32,
+    paddingTop: 10,
+    backgroundColor: 'rgba(5, 6, 8, 0.9)',
+    backdropFilter: 'blur(24px)',
   },
   captureRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 18,
-    paddingTop: 14,
-  },
-  resetButton: {
-    width: 92,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    borderRadius: 18,
-    backgroundColor: 'rgba(18, 22, 28, 0.88)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
-  },
-  resetButtonLabel: {
-    textAlign: 'center',
-    color: '#E2E8F0',
-    fontSize: 13,
-    fontWeight: '600',
+    paddingHorizontal: 48,
+    paddingTop: 20,
   },
   captureButton: {
-    width: 84,
-    height: 84,
-    borderRadius: 42,
-    borderWidth: 3,
-    borderColor: '#F6F3EC',
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(246, 243, 236, 0.08)',
+    shadowColor: '#FFFFFF',
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
   },
   captureButtonDisabled: {
-    opacity: 0.7,
+    opacity: 0.5,
   },
   captureInner: {
-    width: 62,
-    height: 62,
-    borderRadius: 31,
-    backgroundColor: '#F3C97A',
+    width: 0,
+    height: 0,
   },
   captureInfo: {
-    width: 92,
+    width: 60,
     alignItems: 'center',
-    gap: 6,
+    gap: 2,
   },
   captureInfoText: {
-    color: '#E2E8F0',
-    fontSize: 12,
-    lineHeight: 16,
+    color: '#555',
+    fontSize: 10,
     textAlign: 'center',
   },
   loadingScreen: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#0D1016',
+    backgroundColor: '#000000',
   },
   permissionScreen: {
     flex: 1,
-    paddingHorizontal: 24,
+    paddingHorizontal: 32,
     justifyContent: 'center',
-    backgroundColor: '#0D1016',
+    backgroundColor: '#000000',
   },
   permissionEyebrow: {
     color: '#F3C97A',
-    fontSize: 13,
-    fontWeight: '700',
+    fontSize: 11,
+    fontWeight: '600',
     marginBottom: 16,
+    letterSpacing: 1.5,
     textTransform: 'uppercase',
-    letterSpacing: 1,
   },
   permissionTitle: {
     color: '#FAF7F2',
-    fontSize: 32,
-    lineHeight: 38,
-    fontWeight: '800',
+    fontSize: 28,
+    lineHeight: 36,
+    fontWeight: '700',
     marginBottom: 16,
   },
   permissionText: {
-    color: '#C3CBD8',
-    fontSize: 16,
+    color: '#666',
+    fontSize: 15,
     lineHeight: 24,
-    marginBottom: 28,
+    marginBottom: 32,
   },
   primaryButtonSolo: {
-    paddingHorizontal: 18,
+    paddingHorizontal: 28,
     paddingVertical: 16,
-    borderRadius: 18,
+    borderRadius: 20,
     backgroundColor: '#F3C97A',
     alignItems: 'center',
     justifyContent: 'center',
+    shadowColor: '#F3C97A',
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
   },
   primaryButton: {
     flex: 1,
-    paddingHorizontal: 18,
-    paddingVertical: 16,
-    borderRadius: 18,
+    paddingVertical: 14,
+    borderRadius: 20,
     backgroundColor: '#F3C97A',
     alignItems: 'center',
     justifyContent: 'center',
+    shadowColor: '#F3C97A',
+    shadowOpacity: 0.25,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
   },
   primaryButtonLabel: {
-    color: '#11161B',
-    fontSize: 15,
-    fontWeight: '800',
+    color: '#0D1016',
+    fontSize: 14,
+    fontWeight: '700',
   },
   secondaryButton: {
     flex: 1,
-    paddingHorizontal: 18,
-    paddingVertical: 16,
-    borderRadius: 18,
-    backgroundColor: '#1C222C',
+    paddingVertical: 14,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
     alignItems: 'center',
     justifyContent: 'center',
   },
   secondaryButtonLabel: {
-    color: '#F5F1EA',
-    fontSize: 15,
-    fontWeight: '700',
+    color: '#999',
+    fontSize: 14,
+    fontWeight: '600',
   },
   reviewScreen: {
     flex: 1,
-    paddingHorizontal: 18,
-    backgroundColor: '#0E1117',
+    paddingHorizontal: 24,
+    backgroundColor: '#000000',
   },
   reviewHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 16,
     gap: 16,
-    marginTop: 12,
   },
   reviewEyebrow: {
-    color: '#F3C97A',
-    fontSize: 12,
-    fontWeight: '700',
-    marginBottom: 8,
-    textTransform: 'uppercase',
-    letterSpacing: 0.8,
-  },
-  reviewTitle: {
-    color: '#FAF7F2',
-    fontSize: 28,
-    fontWeight: '800',
-    marginBottom: 8,
-  },
-  reviewDescription: {
-    color: '#C7CFDB',
+    color: '#D4AF37',
     fontSize: 14,
-    lineHeight: 20,
-    maxWidth: 250,
+    fontWeight: '600',
   },
   scorePill: {
-    width: 78,
-    height: 78,
-    borderRadius: 28,
+    width: 64,
+    height: 64,
+    borderRadius: 20,
     backgroundColor: '#F3C97A',
     alignItems: 'center',
     justifyContent: 'center',
+    shadowColor: '#F3C97A',
+    shadowOpacity: 0.3,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 4 },
   },
   scorePillValue: {
-    color: '#11161B',
+    color: '#0D1016',
     fontSize: 28,
     fontWeight: '800',
   },
   scorePillLabel: {
-    color: '#11161B',
-    fontSize: 12,
+    color: '#0D1016',
+    fontSize: 11,
     fontWeight: '700',
+    marginTop: 2,
   },
   reviewFrame: {
-    marginTop: 22,
-    borderRadius: 28,
+    marginTop: 24,
+    borderRadius: 20,
     overflow: 'hidden',
     aspectRatio: 4 / 5,
-    backgroundColor: '#151A22',
+    backgroundColor: '#1A1A1A',
+    shadowColor: '#000',
+    shadowOpacity: 0.8,
+    shadowRadius: 24,
+    shadowOffset: { width: 0, height: 8 },
   },
   reviewImage: {
     width: '100%',
@@ -659,77 +703,63 @@ const styles = StyleSheet.create({
   },
   toggleRow: {
     flexDirection: 'row',
-    gap: 10,
-    marginTop: 16,
+    gap: 12,
+    marginTop: 20,
   },
   toggleButton: {
     flex: 1,
-    paddingVertical: 14,
-    borderRadius: 18,
-    backgroundColor: '#1A2029',
+    paddingVertical: 13,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
     alignItems: 'center',
   },
   toggleButtonActive: {
     backgroundColor: '#F3C97A',
   },
   toggleLabel: {
-    color: '#E6ECF5',
-    fontSize: 14,
+    color: '#666',
+    fontSize: 12,
     fontWeight: '700',
+    letterSpacing: 1,
   },
   toggleLabelActive: {
-    color: '#11161B',
+    color: '#0D1016',
   },
   gradePanel: {
     marginTop: 16,
-    padding: 18,
-    borderRadius: 24,
-    backgroundColor: '#161B23',
-  },
-  gradePanelTitle: {
-    color: '#FAF7F2',
-    fontSize: 18,
-    fontWeight: '700',
-    marginBottom: 14,
+    padding: 16,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255, 255, 255, 0.03)',
   },
   gradeStats: {
     flexDirection: 'row',
-    gap: 10,
+    gap: 24,
   },
-  gradeChip: {
+  gradeStat: {
     flex: 1,
-    paddingVertical: 14,
-    borderRadius: 18,
-    borderWidth: 1,
-    backgroundColor: '#11161D',
     alignItems: 'center',
+    gap: 4,
   },
-  gradeChipLabel: {
-    color: '#97A2B3',
-    fontSize: 12,
-    marginBottom: 6,
-  },
-  gradeChipValue: {
-    color: '#FAF7F2',
+  gradeStatIcon: {
+    color: '#666',
     fontSize: 18,
-    fontWeight: '700',
   },
-  gradeHint: {
-    color: '#BFC8D5',
-    fontSize: 13,
-    lineHeight: 20,
-    marginTop: 14,
+  gradeStatValue: {
+    color: '#FAF7F2',
+    fontSize: 15,
+    fontWeight: '600',
   },
   savedMessage: {
     color: '#6FCBFF',
-    fontSize: 13,
-    fontWeight: '700',
-    marginTop: 12,
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 16,
+    textAlign: 'center',
   },
   reviewActions: {
     flexDirection: 'row',
     gap: 12,
-    marginTop: 18,
-    marginBottom: 16,
+    marginTop: 20,
+    marginBottom: 20,
   },
 });

@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef } from 'react';
 import {
   Animated,
-  GestureResponderEvent,
+  Pressable,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { NormalizedPoint, SceneAnalysis } from '../types/camera';
 
@@ -14,6 +15,11 @@ type GuideOverlayProps = {
   previewWidth: number;
   previewHeight: number;
   onPickPoint: (point: NormalizedPoint) => void;
+  liveEnabled?: boolean;
+  showGuideTip?: boolean;
+  onToggleGuideTip?: () => void;
+  /** Stable ref to current focusPoint, so interval always reads latest value */
+  focusPointRef?: React.MutableRefObject<NormalizedPoint>;
 };
 
 const dotStyle = (point: NormalizedPoint, width: number, height: number) => ({
@@ -26,8 +32,41 @@ export function GuideOverlay({
   previewWidth,
   previewHeight,
   onPickPoint,
+  liveEnabled = false,
+  showGuideTip = true,
+  onToggleGuideTip,
+  focusPointRef,
 }: GuideOverlayProps) {
+  const insets = useSafeAreaInsets();
   const progress = useRef(new Animated.Value(0)).current;
+  const liveTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const analysisRef = useRef(analysis);
+  analysisRef.current = analysis;
+
+  const onPickPointRef = useRef(onPickPoint);
+  onPickPointRef.current = onPickPoint;
+
+  useEffect(() => {
+    if (liveEnabled) {
+      liveTickRef.current = setInterval(() => {
+        // Use ref to always get latest focusPoint, avoiding stale closure
+        const point = focusPointRef?.current ?? analysisRef.current.focusPoint;
+        onPickPointRef.current(point);
+      }, 1200);
+    } else {
+      if (liveTickRef.current) {
+        clearInterval(liveTickRef.current);
+        liveTickRef.current = null;
+      }
+    }
+
+    return () => {
+      if (liveTickRef.current) {
+        clearInterval(liveTickRef.current);
+        liveTickRef.current = null;
+      }
+    };
+  }, [liveEnabled, focusPointRef]);
 
   useEffect(() => {
     const animation = Animated.loop(
@@ -91,7 +130,8 @@ export function GuideOverlay({
     : null;
 
   return (
-    <View onStartShouldSetResponder={() => true} onResponderRelease={handlePress} style={StyleSheet.absoluteFill}>
+    <View style={StyleSheet.absoluteFill}>
+      {/* Subtle grid */}
       <View pointerEvents="none" style={styles.grid}>
         <View style={styles.gridColumn} />
         <View style={styles.gridColumn} />
@@ -103,12 +143,22 @@ export function GuideOverlay({
         <View style={styles.gridRow} />
       </View>
 
+      {/* Touchable overlay for picking focus point */}
+      <Pressable
+        style={StyleSheet.absoluteFill}
+        onPress={handlePress}
+      />
+
+      {/* Subject box */}
       {subjectBox ? (
         <View pointerEvents="none" style={[styles.subjectBox, subjectBox]}>
-          <Text style={styles.subjectLabel}>{analysis.subject?.label}</Text>
+          <View style={styles.subjectLabel}>
+            <Text style={styles.subjectLabelText}>{analysis.subject?.label}</Text>
+          </View>
         </View>
       ) : null}
 
+      {/* Arrow rail */}
       <View
         pointerEvents="none"
         style={[
@@ -141,6 +191,7 @@ export function GuideOverlay({
         ]}
       />
 
+      {/* Ideal point (gold) */}
       <View
         pointerEvents="none"
         style={[
@@ -148,6 +199,7 @@ export function GuideOverlay({
           dotStyle(analysis.idealPoint, previewWidth, previewHeight),
         ]}
       />
+      {/* Focus point (white) */}
       <View
         pointerEvents="none"
         style={[
@@ -156,12 +208,10 @@ export function GuideOverlay({
         ]}
       />
 
-      <View pointerEvents="none" style={styles.callout}>
-        <Text style={styles.calloutLabel}>
-          {analysis.source === 'vision' ? '视觉模型引导中' : '本地构图推断'}
-        </Text>
-        <Text style={styles.calloutText}>{analysis.instruction}</Text>
-      </View>
+      {/* Callout - frosted glass (no close button, handled in App.tsx topBar) */}
+      {showGuideTip ? (
+        <View style={[styles.callout, { top: insets.top + 12 }]} pointerEvents="none" />
+      ) : null}
     </View>
   );
 }
@@ -174,7 +224,7 @@ const styles = StyleSheet.create({
   gridColumn: {
     flex: 1,
     borderRightWidth: 1,
-    borderRightColor: 'rgba(255,255,255,0.14)',
+    borderRightColor: 'rgba(255,255,255,0.04)',
   },
   gridRows: {
     ...StyleSheet.absoluteFillObject,
@@ -182,31 +232,40 @@ const styles = StyleSheet.create({
   gridRow: {
     flex: 1,
     borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255,255,255,0.14)',
+    borderBottomColor: 'rgba(255,255,255,0.04)',
   },
   subjectBox: {
     position: 'absolute',
     borderWidth: 2,
-    borderColor: 'rgba(111, 203, 255, 0.92)',
-    borderRadius: 16,
-    backgroundColor: 'rgba(111, 203, 255, 0.08)',
+    borderColor: 'rgba(111, 203, 255, 0.7)',
+    borderRadius: 20,
+    backgroundColor: 'rgba(111, 203, 255, 0.06)',
+    shadowColor: '#6FCBFF',
+    shadowOpacity: 0.2,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
   },
   subjectLabel: {
-    alignSelf: 'flex-start',
-    marginTop: -12,
-    marginLeft: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 999,
-    backgroundColor: '#6FCBFF',
-    color: '#0D1720',
+    position: 'absolute',
+    top: -14,
+    left: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 12,
+    backgroundColor: 'rgba(111, 203, 255, 0.9)',
+  },
+  subjectLabelText: {
+    color: '#0A0A0A',
     fontSize: 11,
-    fontWeight: '800',
+    fontWeight: '700',
   },
   arrowRail: {
     position: 'absolute',
     height: 2,
     backgroundColor: '#6FCBFF',
+    shadowColor: '#6FCBFF',
+    shadowOpacity: 0.4,
+    shadowRadius: 4,
   },
   arrowHead: {
     position: 'absolute',
@@ -223,7 +282,11 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     borderWidth: 2,
     borderColor: '#F3C97A',
-    backgroundColor: 'rgba(243, 201, 122, 0.18)',
+    backgroundColor: 'rgba(243, 201, 122, 0.15)',
+    shadowColor: '#F3C97A',
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 2 },
   },
   focusPoint: {
     position: 'absolute',
@@ -231,30 +294,27 @@ const styles = StyleSheet.create({
     height: 32,
     borderRadius: 16,
     borderWidth: 2,
-    borderColor: '#FFFFFF',
-    backgroundColor: 'rgba(255,255,255,0.12)',
+    borderColor: 'rgba(255, 255, 255, 0.7)',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    shadowColor: '#FFF',
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
   },
   callout: {
     position: 'absolute',
-    left: 18,
-    top: 72,
-    maxWidth: 260,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 18,
-    backgroundColor: 'rgba(10, 12, 16, 0.6)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
-  },
-  calloutLabel: {
-    color: '#F3C97A',
-    fontSize: 12,
-    fontWeight: '700',
-    marginBottom: 4,
-  },
-  calloutText: {
-    color: '#F7F4EE',
-    fontSize: 13,
-    lineHeight: 18,
+    left: 20,
+    top: 100,
+    maxWidth: 240,
+    paddingLeft: 16,
+    paddingRight: 40,
+    paddingTop: 12,
+    paddingBottom: 12,
+    borderRadius: 10,
+    backgroundColor: 'rgba(8, 9, 12, 0.78)',
+    shadowColor: '#000',
+    shadowOpacity: 0.35,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 4 },
   },
 });

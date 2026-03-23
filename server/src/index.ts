@@ -9,6 +9,8 @@ dotenv.config();
 
 const port = Number(process.env.PORT || 3001);
 const model = process.env.OPENAI_VISION_MODEL || 'gpt-5.4-mini';
+const visionApiProvider = (process.env.VISION_API_PROVIDER || 'zhipu').toLowerCase();
+const zhipuApiKey = process.env.ZHIPU_API_KEY;
 
 const pointSchema = z.object({
   x: z.number().min(0).max(1),
@@ -100,6 +102,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     model,
+    provider: visionApiProvider,
   });
 });
 
@@ -120,38 +123,89 @@ app.post('/vision/analyze', async (req, res) => {
 5. 输出简短中文 instruction、notes、拍摄参数建议和最匹配的滤镜 preset。
 `.trim();
 
-    const response = await client.responses.parse({
-      model,
-      reasoning: {
-        effort: 'minimal',
-      },
-      input: [
-        {
-          role: 'system',
-          content: [{ type: 'input_text', text: systemPrompt }],
-        },
-        {
-          role: 'user',
-          content: [
-            { type: 'input_text', text: prompt },
-            {
-              type: 'input_image',
-              image_url: `data:image/jpeg;base64,${body.imageBase64}`,
-              detail: 'low',
-            },
-          ],
-        },
-      ],
-      text: {
-        format: zodTextFormat(responseSchema, 'camera_scene_analysis'),
-      },
-    });
+    let result: z.infer<typeof responseSchema>;
 
-    if (!response.output_parsed) {
-      throw new Error('Vision response did not contain parsed JSON');
+    if (visionApiProvider === 'zhipu') {
+      if (!zhipuApiKey) {
+        throw new Error('ZHIPU_API_KEY is required in server/.env');
+      }
+
+      const zhipuResponse = await fetch('https://open.bigmodel.cn/api/callback/vision/glm-4v', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${zhipuApiKey}`,
+        },
+        body: JSON.stringify({
+          model: 'glm-4v',
+          image: `data:image/jpeg;base64,${body.imageBase64}`,
+          prompt,
+        }),
+      });
+
+      if (!zhipuResponse.ok) {
+        const errText = await zhipuResponse.text();
+        throw new Error(`Zhipu API error ${zhipuResponse.status}: ${errText}`);
+      }
+
+      const zhipuData = await zhipuResponse.json() as {
+        data?: { content?: string };
+      };
+
+      const contentStr = zhipuData?.data?.content;
+      if (!contentStr) {
+        throw new Error('Zhipu response missing data.content');
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(contentStr);
+      } catch {
+        throw new Error('Zhipu response content is not valid JSON: ' + contentStr);
+      }
+
+      const validated = responseSchema.parse(parsed);
+      result = validated;
+    } else {
+      if (!process.env.OPENAI_API_KEY) {
+        throw new Error('OPENAI_API_KEY is required in server/.env');
+      }
+
+      const response = await client.responses.parse({
+        model,
+        reasoning: {
+          effort: 'minimal',
+        },
+        input: [
+          {
+            role: 'system',
+            content: [{ type: 'input_text', text: systemPrompt }],
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'input_text', text: prompt },
+              {
+                type: 'input_image',
+                image_url: `data:image/jpeg;base64,${body.imageBase64}`,
+                detail: 'low',
+              },
+            ],
+          },
+        ],
+        text: {
+          format: zodTextFormat(responseSchema, 'camera_scene_analysis'),
+        },
+      });
+
+      if (!response.output_parsed) {
+        throw new Error('Vision response did not contain parsed JSON');
+      }
+
+      result = response.output_parsed;
     }
 
-    res.json(response.output_parsed);
+    res.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown server error';
     res.status(500).send(message);
