@@ -66,7 +66,7 @@ cd server && npm install
 
 **服务端** (`server/.env`)：
 ```env
-OPENAI_API_KEY=b0792c28ba6a470f90bbb9f08bd00e78.csFQWmlr665jd9Y3
+OPENAI_API_KEY=your_api_key_here
 OPENAI_BASE_URL=https://open.bigmodel.cn/api/coding/paas/v4
 OPENAI_VISION_MODEL=glm-5
 PORT=3001
