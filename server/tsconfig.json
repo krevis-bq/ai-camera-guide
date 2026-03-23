@@ -6,9 +6,11 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "outDir": "dist"
+    "outDir": "dist",
+    "baseUrl": "..",
+    "paths": {
+      "@langchain/*": ["node_modules/@langchain/*"]
+    }
   },
-  "include": [
-    "src"
-  ]
+  "include": ["src"]
 }

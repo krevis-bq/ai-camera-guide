@@ -1,32 +1,5 @@
 {
   "name": "ai-camera-guide",
-  "version": "1.0.0",
-  "main": "index.ts",
-  "scripts": {
-    "start": "expo start",
-    "android": "expo run:android",
-    "ios": "expo run:ios",
-    "web": "expo start --web",
-    "server": "npm --prefix server run dev",
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@shopify/react-native-skia": "2.4.18",
-    "expo": "~55.0.6",
-    "expo-camera": "~55.0.9",
-    "expo-dev-client": "~55.0.16",
-    "expo-file-system": "~55.0.10",
-    "expo-image-manipulator": "~55.0.10",
-    "expo-linear-gradient": "~55.0.9",
-    "expo-media-library": "~55.0.9",
-    "expo-sensors": "~55.0.9",
-    "expo-status-bar": "~55.0.4",
-    "react": "19.2.0",
-    "react-native": "0.83.2"
-  },
-  "devDependencies": {
-    "@types/react": "~19.2.2",
-    "typescript": "~5.9.2"
-  },
-  "private": true
+  "private": true,
+  "workspaces": ["client", "server"]
 }
